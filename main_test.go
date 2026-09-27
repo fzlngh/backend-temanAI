@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -52,6 +53,81 @@ func TestProviderRequestMapping(t *testing.T) {
 	}
 }
 
+func TestAttachmentProviderRequestMapping(t *testing.T) {
+	files := []attachment{
+		{Name: "foto.png", MIMEType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})},
+		{Name: "laporan.pdf", MIMEType: "application/pdf", Data: base64.StdEncoding.EncodeToString([]byte("%PDF-1.7"))},
+	}
+	messages := []chatMessage{{Role: "user", Content: "Ringkas file ini"}}
+
+	gemini := toGeminiRequestWithAttachments(messages, "TemanAI", files)
+	parts := gemini.Contents[0].Parts
+	if len(parts) != 3 || parts[0].Text != "Ringkas file ini" ||
+		parts[1].InlineData == nil || parts[1].InlineData.MIMEType != "image/png" ||
+		parts[2].InlineData == nil || parts[2].InlineData.Data != files[1].Data {
+		t.Fatalf("Gemini final user parts do not contain text and both files: %#v", parts)
+	}
+
+	openAI := toOpenAIRequestWithAttachments(providerRouter, "test-model", messages, "TemanAI", files)
+	content, ok := openAI.Messages[1].Content.([]openAIContentPart)
+	if !ok || len(content) != 3 || content[0].Text != "Ringkas file ini" ||
+		content[1].ImageURL == nil || content[1].ImageURL.URL != "data:image/png;base64,"+files[0].Data ||
+		content[2].File == nil || content[2].File.Filename != "laporan.pdf" ||
+		content[2].File.FileData != "data:application/pdf;base64,"+files[1].Data {
+		t.Fatalf("OpenRouter final user content mapping is invalid: %#v", openAI.Messages[1].Content)
+	}
+
+	groq := toOpenAIRequestWithAttachments(providerGroq, "test-model", messages, "TemanAI", files[:1])
+	groqContent, ok := groq.Messages[1].Content.([]openAIContentPart)
+	if !ok || len(groqContent) != 2 || groqContent[1].ImageURL == nil {
+		t.Fatalf("Groq image mapping is invalid: %#v", groq.Messages[1].Content)
+	}
+	if providerSupportsAttachments(providerGroq, files[1:]) {
+		t.Fatal("Groq must not be selected for PDF input")
+	}
+}
+
+func TestValidateAttachments(t *testing.T) {
+	valid := func(name, mimeType string, data []byte) attachment {
+		return attachment{Name: name, MIMEType: mimeType, Data: base64.StdEncoding.EncodeToString(data)}
+	}
+	tests := []struct {
+		name        string
+		attachments []attachment
+		wantErr     bool
+	}{
+		{"valid pdf", []attachment{valid("dokumen.pdf", "application/pdf", []byte("%PDF-1.7"))}, false},
+		{"valid jpeg", []attachment{valid("foto.jpeg", "image/jpeg", []byte{0xff, 0xd8, 0xff})}, false},
+		{"unsafe path", []attachment{valid("../dokumen.pdf", "application/pdf", []byte("%PDF-1.7"))}, true},
+		{"mismatched signature", []attachment{valid("foto.png", "image/png", []byte("not a png"))}, true},
+		{"unsupported mime", []attachment{{Name: "file.gif", MIMEType: "image/gif", Data: "R0lGODlh"}}, true},
+		{"data url prefix", []attachment{{Name: "dokumen.pdf", MIMEType: "application/pdf", Data: "data:application/pdf;base64,JVBERi0="}}, true},
+		{"non standard base64", []attachment{{Name: "dokumen.pdf", MIMEType: "application/pdf", Data: "JVBERi0_"}}, true},
+		{"too many", make([]attachment, maxAttachments+1), true},
+		{"oversized individual", []attachment{valid("foto.jpg", "image/jpeg", append([]byte{0xff, 0xd8, 0xff}, make([]byte, maxAttachmentBytes-2)...))}, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAttachments(test.attachments)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateAttachments() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAttachmentAggregateLimit(t *testing.T) {
+	data := append([]byte{0xff, 0xd8, 0xff}, make([]byte, maxAttachmentBytes-3)...)
+	files := []attachment{
+		{Name: "one.jpg", MIMEType: "image/jpeg", Data: base64.StdEncoding.EncodeToString(data)},
+		{Name: "two.jpg", MIMEType: "image/jpeg", Data: base64.StdEncoding.EncodeToString(data)},
+		{Name: "three.jpg", MIMEType: "image/jpeg", Data: base64.StdEncoding.EncodeToString([]byte{0xff, 0xd8, 0xff})},
+	}
+	if err := validateAttachments(files); err == nil || !strings.Contains(err.Error(), "12 MiB") {
+		t.Fatalf("aggregate limit error = %v, want 12 MiB validation error", err)
+	}
+}
+
 func TestAssistantNameAndDeveloperAttributionAreInProviderInstructions(t *testing.T) {
 	messages := []chatMessage{{Role: "user", Content: "Kamu dikembangkan oleh siapa?"}}
 	gemini := toGeminiRequest(messages, "Asistenku")
@@ -60,8 +136,9 @@ func TestAssistantNameAndDeveloperAttributionAreInProviderInstructions(t *testin
 		t.Fatalf("Gemini system instruction missing attribution or display name: %q", instruction)
 	}
 	openAI := toOpenAIRequest("test-model", messages, "Asistenku")
-	if !strings.Contains(openAI.Messages[0].Content, "Dhiyaa Fazila Nugraha") || !strings.Contains(openAI.Messages[0].Content, "Asistenku") {
-		t.Fatalf("OpenAI-compatible system instruction missing attribution or display name: %q", openAI.Messages[0].Content)
+	openAIInstruction, isString := openAI.Messages[0].Content.(string)
+	if !isString || !strings.Contains(openAIInstruction, "Dhiyaa Fazila Nugraha") || !strings.Contains(openAIInstruction, "Asistenku") {
+		t.Fatalf("OpenAI-compatible system instruction missing attribution or display name: %v", openAI.Messages[0].Content)
 	}
 	if got := normalizeAssistantName("  "); got != "TemanAI" {
 		t.Fatalf("empty assistant name = %q, want default", got)
@@ -336,6 +413,7 @@ func TestProviderFailuresFallThroughAndReturnSafeError(t *testing.T) {
 			{kind: providerGroq, apiKey: "key-two", model: "groq", endpoint: upstream.URL},
 		},
 	}
+
 	request := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"messages":[{"role":"user","content":"Halo"}]}`))
 	request.Header.Set("Authorization", "Bearer token")
 	response := httptest.NewRecorder()
@@ -345,5 +423,88 @@ func TestProviderFailuresFallThroughAndReturnSafeError(t *testing.T) {
 	}
 	if strings.Contains(response.Body.String(), "secret upstream diagnostic") || strings.Contains(response.Body.String(), "key-one") {
 		t.Fatal("provider failure leaked sensitive detail")
+	}
+}
+
+func TestChatReturnsClearErrorWhenNoProviderSupportsPDF(t *testing.T) {
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer auth.Close()
+	app := &server{
+		supabaseURL: auth.URL,
+		supabaseKey: "anon",
+		authClient:  auth.Client(),
+		providers:   []provider{{kind: providerGroq, apiKey: "key", model: "test"}},
+	}
+	payload := `{"messages":[{"role":"user","content":"Ringkas"}],"attachments":[{"name":"dokumen.pdf","mimeType":"application/pdf","data":"JVBERi0xLjc="}]}`
+	request := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer access-token")
+	response := httptest.NewRecorder()
+	app.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "PDF memerlukan Gemini atau OpenRouter") {
+		t.Fatalf("unsupported PDF response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestChatSkipsGroqForPDFAndPreservesAttachmentInOpenRouterFallback(t *testing.T) {
+	var groqCalls, routerCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/groq":
+			groqCalls++
+			t.Error("Groq should not be called with a PDF attachment")
+		case "/router":
+			routerCalls++
+			var body struct {
+				Messages []struct {
+					Role    string          `json:"role"`
+					Content json.RawMessage `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode OpenRouter request: %v", err)
+			}
+			var content []struct {
+				Type string `json:"type"`
+				File *struct {
+					Filename string `json:"filename"`
+					FileData string `json:"file_data"`
+				} `json:"file,omitempty"`
+			}
+			if err := json.Unmarshal(body.Messages[len(body.Messages)-1].Content, &content); err != nil {
+				t.Errorf("decode OpenRouter final user content: %v", err)
+			}
+			if len(content) != 2 || content[1].File == nil || content[1].File.Filename != "dokumen.pdf" ||
+				content[1].File.FileData != "data:application/pdf;base64,JVBERi0xLjc=" {
+				t.Errorf("OpenRouter attachment not preserved: %#v", content)
+			}
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Ringkasan PDF"}}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer auth.Close()
+	app := &server{
+		supabaseURL: auth.URL,
+		supabaseKey: "anon",
+		authClient:  auth.Client(),
+		client:      upstream.Client(),
+		providers: []provider{
+			{kind: providerGroq, apiKey: "groq-key", model: "test-groq", endpoint: upstream.URL + "/groq"},
+			{kind: providerRouter, apiKey: "router-key", model: "test-router", endpoint: upstream.URL + "/router"},
+		},
+	}
+	payload := `{"messages":[{"role":"user","content":"Ringkas"}],"attachments":[{"name":"dokumen.pdf","mimeType":"application/pdf","data":"JVBERi0xLjc="}]}`
+	request := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer access-token")
+	response := httptest.NewRecorder()
+	app.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || groqCalls != 0 || routerCalls != 1 {
+		t.Fatalf("fallback status=%d, groq=%d router=%d body=%s", response.Code, groqCalls, routerCalls, response.Body.String())
 	}
 }

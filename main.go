@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,9 +26,12 @@ const (
 	defaultGeminiModel     = "gemini-3.8-flash"
 	defaultGroqModel       = "openai/gpt-oss-120b"
 	defaultRouterModel     = "openrouter/free"
-	maxRequestBytes        = 1 << 20
+	maxRequestBytes        = 18 << 20
 	maxMessages            = 20
 	maxContentRunes        = 12_000
+	maxAttachments         = 4
+	maxAttachmentBytes     = 6 << 20
+	maxAggregateFileBytes  = 12 << 20
 	providerTimeout        = 50 * time.Second
 	providerAttemptTimeout = 18 * time.Second
 )
@@ -42,6 +46,13 @@ type chatMessage struct {
 type chatRequest struct {
 	Messages      []chatMessage `json:"messages"`
 	AssistantName string        `json:"assistantName,omitempty"`
+	Attachments   []attachment  `json:"attachments,omitempty"`
+}
+
+type attachment struct {
+	Name     string `json:"name"`
+	MIMEType string `json:"mimeType"`
+	Data     string `json:"data"`
 }
 
 type apiError struct {
@@ -91,7 +102,13 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text string `json:"text"`
+	Text       string            `json:"text,omitempty"`
+	InlineData *geminiInlineData `json:"inlineData,omitempty"`
+}
+
+type geminiInlineData struct {
+	MIMEType string `json:"mimeType"`
+	Data     string `json:"data"`
 }
 
 type geminiResponse struct {
@@ -111,7 +128,23 @@ type openAIRequest struct {
 
 type openAIMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+type openAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+	File     *openAIFile     `json:"file,omitempty"`
+}
+
+type openAIImageURL struct {
+	URL string `json:"url"`
+}
+
+type openAIFile struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 type openAIResponse struct {
@@ -264,13 +297,18 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&request); err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
-			writeError(w, http.StatusRequestEntityTooLarge, "Ukuran permintaan melebihi batas 1 MiB.")
+			writeError(w, http.StatusRequestEntityTooLarge, "Ukuran permintaan melebihi batas 18 MiB.")
 			return
 		}
 		writeError(w, http.StatusBadRequest, "Format JSON tidak valid.")
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusRequestEntityTooLarge, "Ukuran permintaan melebihi batas 18 MiB.")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "Kirim tepat satu objek JSON.")
 		return
 	}
@@ -278,7 +316,19 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validateAttachments(request.Attachments); err != nil {
+		if errors.Is(err, errAttachmentTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if len(s.providers) == 0 {
+		if len(request.Attachments) > 0 {
+			writeError(w, http.StatusServiceUnavailable, "Belum ada penyedia AI yang dikonfigurasi untuk memproses lampiran.")
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "Belum ada penyedia AI yang dikonfigurasi di backend.")
 		return
 	}
@@ -289,7 +339,13 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
+	compatibleProviderFound := len(request.Attachments) == 0
 	for _, configured := range s.providers {
+		if !providerSupportsAttachments(configured.kind, request.Attachments) {
+			log.Printf("provider=%s detail=unsupported_attachment", configured.kind)
+			continue
+		}
+		compatibleProviderFound = true
 		if ctx.Err() != nil {
 			if r.Context().Err() != nil {
 				return
@@ -297,7 +353,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 			writeProviderTimeout(w, ctx.Err())
 			return
 		}
-		reply, status, failure := s.callProvider(ctx, configured, request.Messages, normalizeAssistantName(request.AssistantName))
+		reply, status, failure := s.callProviderWithAttachments(ctx, configured, request.Messages, normalizeAssistantName(request.AssistantName), request.Attachments)
 		if failure == "" && reply != "" {
 			writeJSON(w, http.StatusOK, map[string]string{
 				"reply":    reply,
@@ -314,6 +370,10 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 			writeProviderTimeout(w, ctx.Err())
 			return
 		}
+	}
+	if !compatibleProviderFound {
+		writeError(w, http.StatusUnprocessableEntity, "Tidak ada penyedia AI yang dikonfigurasi yang mendukung jenis lampiran ini. PDF memerlukan Gemini atau OpenRouter; foto dapat diproses oleh Gemini, Groq, atau OpenRouter.")
+		return
 	}
 	writeError(w, http.StatusBadGateway, "Semua penyedia AI sedang gagal. Silakan coba lagi nanti.")
 }
@@ -370,15 +430,19 @@ func (s *server) verifyAccessToken(parent context.Context, token string) error {
 }
 
 func (s *server) callProvider(ctx context.Context, configured provider, messages []chatMessage, assistantName string) (string, int, string) {
+	return s.callProviderWithAttachments(ctx, configured, messages, assistantName, nil)
+}
+
+func (s *server) callProviderWithAttachments(ctx context.Context, configured provider, messages []chatMessage, assistantName string, attachments []attachment) (string, int, string) {
 	providerCtx, cancel := context.WithTimeout(ctx, providerAttemptTimeout)
 	defer cancel()
 	var body []byte
 	var err error
 	switch configured.kind {
 	case providerGemini:
-		body, err = json.Marshal(toGeminiRequest(messages, assistantName))
+		body, err = json.Marshal(toGeminiRequestWithAttachments(messages, assistantName, attachments))
 	case providerGroq, providerRouter:
-		body, err = json.Marshal(toOpenAIRequest(configured.model, messages, assistantName))
+		body, err = json.Marshal(toOpenAIRequestWithAttachments(configured.kind, configured.model, messages, assistantName, attachments))
 	default:
 		return "", 0, "invalid_provider"
 	}
@@ -480,7 +544,22 @@ func extractProviderReply(kind providerKind, data []byte) (string, error) {
 		if err := json.Unmarshal(data, &response); err != nil || len(response.Choices) == 0 {
 			return "", errors.New("invalid OpenAI-compatible response")
 		}
-		return response.Choices[0].Message.Content, nil
+		switch content := response.Choices[0].Message.Content.(type) {
+		case string:
+			return content, nil
+		case []any:
+			var parts []string
+			for _, item := range content {
+				if part, ok := item.(map[string]any); ok {
+					if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
+						parts = append(parts, strings.TrimSpace(text))
+					}
+				}
+			}
+			return strings.Join(parts, "\n"), nil
+		default:
+			return "", errors.New("invalid OpenAI-compatible content")
+		}
 	default:
 		return "", errors.New("unknown provider")
 	}
@@ -524,6 +603,10 @@ func normalizeAssistantName(name string) string {
 }
 
 func toGeminiRequest(messages []chatMessage, assistantName string) geminiRequest {
+	return toGeminiRequestWithAttachments(messages, assistantName, nil)
+}
+
+func toGeminiRequestWithAttachments(messages []chatMessage, assistantName string, attachments []attachment) geminiRequest {
 	instruction := assistantInstruction + " Nama tampilan asisten yang diminta pengguna adalah: " + normalizeAssistantName(assistantName) + "."
 	request := geminiRequest{
 		SystemInstruction: geminiContent{Parts: []geminiPart{{Text: instruction}}},
@@ -531,20 +614,30 @@ func toGeminiRequest(messages []chatMessage, assistantName string) geminiRequest
 	}
 	request.GenerationConfig.Temperature = 0.7
 	request.GenerationConfig.MaxOutputTokens = 2048
-	for _, message := range messages {
+	for i, message := range messages {
 		role := message.Role
 		if role == "assistant" {
 			role = "model"
 		}
+		parts := []geminiPart{{Text: message.Content}}
+		if i == len(messages)-1 && role == "user" {
+			for _, file := range attachments {
+				parts = append(parts, geminiPart{InlineData: &geminiInlineData{MIMEType: file.MIMEType, Data: file.Data}})
+			}
+		}
 		request.Contents = append(request.Contents, geminiContent{
 			Role:  role,
-			Parts: []geminiPart{{Text: message.Content}},
+			Parts: parts,
 		})
 	}
 	return request
 }
 
 func toOpenAIRequest(model string, messages []chatMessage, assistantName string) openAIRequest {
+	return toOpenAIRequestWithAttachments(providerRouter, model, messages, assistantName, nil)
+}
+
+func toOpenAIRequestWithAttachments(kind providerKind, model string, messages []chatMessage, assistantName string, attachments []attachment) openAIRequest {
 	result := openAIRequest{
 		Model:       model,
 		Messages:    make([]openAIMessage, 0, len(messages)+1),
@@ -553,10 +646,138 @@ func toOpenAIRequest(model string, messages []chatMessage, assistantName string)
 	}
 	instruction := assistantInstruction + " Nama tampilan asisten yang diminta pengguna adalah: " + normalizeAssistantName(assistantName) + "."
 	result.Messages = append(result.Messages, openAIMessage{Role: "system", Content: instruction})
-	for _, message := range messages {
-		result.Messages = append(result.Messages, openAIMessage{Role: message.Role, Content: message.Content})
+	for i, message := range messages {
+		var content any = message.Content
+		if i == len(messages)-1 && message.Role == "user" && len(attachments) > 0 {
+			parts := []openAIContentPart{{Type: "text", Text: message.Content}}
+			for _, file := range attachments {
+				if strings.HasPrefix(file.MIMEType, "image/") {
+					parts = append(parts, openAIContentPart{
+						Type:     "image_url",
+						ImageURL: &openAIImageURL{URL: "data:" + file.MIMEType + ";base64," + file.Data},
+					})
+				} else if kind == providerRouter && file.MIMEType == "application/pdf" {
+					parts = append(parts, openAIContentPart{
+						Type: "file",
+						File: &openAIFile{Filename: file.Name, FileData: "data:" + file.MIMEType + ";base64," + file.Data},
+					})
+				}
+			}
+			content = parts
+		}
+		result.Messages = append(result.Messages, openAIMessage{Role: message.Role, Content: content})
 	}
 	return result
+}
+
+var errAttachmentTooLarge = errors.New("attachment exceeds size limit")
+
+func validateAttachments(attachments []attachment) error {
+	if len(attachments) > maxAttachments {
+		return fmt.Errorf("Maksimal %d lampiran per permintaan.", maxAttachments)
+	}
+	totalBytes := 0
+	for i := range attachments {
+		file := &attachments[i]
+		switch file.MIMEType {
+		case "application/pdf", "image/jpeg", "image/png", "image/webp":
+		default:
+			return fmt.Errorf("Jenis file lampiran ke-%d tidak didukung. Gunakan PDF, JPEG, PNG, atau WebP.", i+1)
+		}
+		if !safeAttachmentName(file.Name, file.MIMEType) {
+			return fmt.Errorf("Nama file lampiran ke-%d tidak aman atau ekstensi tidak sesuai jenis file.", i+1)
+		}
+		// Check encoded length before allocating decoded bytes.
+		maxEncoded := base64.StdEncoding.EncodedLen(maxAttachmentBytes)
+		if len(file.Data) == 0 {
+			return fmt.Errorf("Lampiran ke-%d kosong.", i+1)
+		}
+		if len(file.Data) > maxEncoded {
+			return fmt.Errorf("%w: Lampiran ke-%d melebihi batas 6 MiB per file.", errAttachmentTooLarge, i+1)
+		}
+		for _, character := range file.Data {
+			if !((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') ||
+				(character >= '0' && character <= '9') || character == '+' || character == '/' || character == '=') {
+				return fmt.Errorf("Data base64 lampiran ke-%d tidak valid; kirim base64 standar tanpa awalan data URL.", i+1)
+			}
+		}
+		decoded, err := base64.StdEncoding.Strict().DecodeString(file.Data)
+		if err != nil {
+			return fmt.Errorf("Data base64 lampiran ke-%d tidak valid; kirim base64 standar tanpa awalan data URL.", i+1)
+		}
+		if len(decoded) > maxAttachmentBytes {
+			return fmt.Errorf("%w: Lampiran ke-%d melebihi batas 6 MiB per file.", errAttachmentTooLarge, i+1)
+		}
+		totalBytes += len(decoded)
+		if totalBytes > maxAggregateFileBytes {
+			return fmt.Errorf("%w: Total ukuran semua lampiran melebihi batas 12 MiB.", errAttachmentTooLarge)
+		}
+		if !matchesAttachmentSignature(file.MIMEType, decoded) {
+			return fmt.Errorf("Isi file lampiran ke-%d tidak cocok dengan MIME type %s.", i+1, file.MIMEType)
+		}
+	}
+	return nil
+}
+
+func safeAttachmentName(name, mimeType string) bool {
+	if name == "" || len(name) > 255 || strings.TrimSpace(name) != name || name == "." || name == ".." {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || strings.ContainsRune(`/\`, r) {
+			return false
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune(" ._-()", r) {
+			return false
+		}
+	}
+	lastDot := strings.LastIndex(name, ".")
+	if lastDot <= 0 {
+		return false
+	}
+	extension := strings.ToLower(name[lastDot:])
+	switch mimeType {
+	case "application/pdf":
+		return extension == ".pdf"
+	case "image/jpeg":
+		return extension == ".jpg" || extension == ".jpeg"
+	case "image/png":
+		return extension == ".png"
+	case "image/webp":
+		return extension == ".webp"
+	default:
+		return false
+	}
+}
+
+func matchesAttachmentSignature(mimeType string, data []byte) bool {
+	switch mimeType {
+	case "application/pdf":
+		return len(data) >= 5 && bytes.HasPrefix(data, []byte("%PDF-"))
+	case "image/jpeg":
+		return len(data) >= 3 && bytes.Equal(data[:3], []byte{0xff, 0xd8, 0xff})
+	case "image/png":
+		return len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	case "image/webp":
+		return len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+	default:
+		return false
+	}
+}
+
+func providerSupportsAttachments(kind providerKind, attachments []attachment) bool {
+	if len(attachments) == 0 || kind == providerGemini || kind == providerRouter {
+		return true
+	}
+	if kind == providerGroq {
+		for _, file := range attachments {
+			if file.MIMEType == "application/pdf" {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func parseAllowedOrigins(config string) []string {
