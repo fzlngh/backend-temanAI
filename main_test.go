@@ -366,6 +366,56 @@ func TestHealthContainsAvailabilityOnly(t *testing.T) {
 	}
 }
 
+func TestRoutesPreserveMethodNotAllowedAndNotFoundResponses(t *testing.T) {
+	handler := (&server{}).routes()
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{"health wrong method", http.MethodPost, "/health", http.StatusMethodNotAllowed, `{"error":"Metode HTTP tidak diizinkan."}`},
+		{"chat wrong method", http.MethodGet, "/api/chat", http.StatusMethodNotAllowed, `{"error":"Metode HTTP tidak diizinkan."}`},
+		{"unknown endpoint", http.MethodGet, "/unknown", http.StatusNotFound, `{"error":"Endpoint tidak ditemukan."}`},
+		{"health trailing slash", http.MethodGet, "/health/", http.StatusNotFound, `{"error":"Endpoint tidak ditemukan."}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if got := strings.TrimSpace(response.Body.String()); got != test.wantBody {
+				t.Fatalf("body = %q, want %q", got, test.wantBody)
+			}
+		})
+	}
+}
+
+func TestRoutesApplyCORSBeforeRouting(t *testing.T) {
+	handler := (&server{allowedOrigin: parseAllowedOrigins("https://app.example.com")}).routes()
+
+	preflight := httptest.NewRequest(http.MethodOptions, "/api/chat", nil)
+	preflight.Header.Set("Origin", "https://app.example.com")
+	preflightResponse := httptest.NewRecorder()
+	handler.ServeHTTP(preflightResponse, preflight)
+	if preflightResponse.Code != http.StatusNoContent ||
+		preflightResponse.Header().Get("Access-Control-Allow-Origin") != "https://app.example.com" {
+		t.Fatalf("preflight response = %d, allow-origin=%q", preflightResponse.Code, preflightResponse.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	blocked := httptest.NewRequest(http.MethodGet, "/unknown", nil)
+	blocked.Header.Set("Origin", "https://not-allowed.example")
+	blockedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(blockedResponse, blocked)
+	if blockedResponse.Code != http.StatusForbidden || !strings.Contains(blockedResponse.Body.String(), "Origin tidak diizinkan.") {
+		t.Fatalf("disallowed origin response = %d %s", blockedResponse.Code, blockedResponse.Body.String())
+	}
+}
+
 func TestCORSLocalAndConfiguredOrigins(t *testing.T) {
 	handler := (&server{
 		allowedOrigin: parseAllowedOrigins("https://app.example.com, https://admin.example.com"),

@@ -20,6 +20,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/go-chi/chi/v5"
 )
 
 const (
@@ -167,7 +169,7 @@ func main() {
 	}
 
 	app := newServerFromEnv()
-	handler := app.cors(app.routes())
+	handler := app.routes()
 	httpServer := &http.Server{
 		Addr:              ":" + port,
 		Handler:           handler,
@@ -236,18 +238,17 @@ func envOrDefault(name, fallback string) string {
 }
 
 func (s *server) routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/health" && r.Method == http.MethodGet:
-			s.health(w, r)
-		case r.URL.Path == "/api/chat" && r.Method == http.MethodPost:
-			s.chat(w, r)
-		case r.URL.Path == "/health" || r.URL.Path == "/api/chat":
-			writeError(w, http.StatusMethodNotAllowed, "Metode HTTP tidak diizinkan.")
-		default:
-			writeError(w, http.StatusNotFound, "Endpoint tidak ditemukan.")
-		}
+	router := chi.NewRouter()
+	router.Use(s.cors)
+	router.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusMethodNotAllowed, "Metode HTTP tidak diizinkan.")
 	})
+	router.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "Endpoint tidak ditemukan.")
+	})
+	router.Get("/health", s.health)
+	router.Post("/api/chat", s.chat)
+	return router
 }
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
