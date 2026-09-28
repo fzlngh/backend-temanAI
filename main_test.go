@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -99,6 +100,7 @@ func TestValidateAttachments(t *testing.T) {
 		{"valid pdf", []attachment{valid("dokumen.pdf", "application/pdf", []byte("%PDF-1.7"))}, false},
 		{"valid jpeg", []attachment{valid("foto.jpeg", "image/jpeg", []byte{0xff, 0xd8, 0xff})}, false},
 		{"unsafe path", []attachment{valid("../dokumen.pdf", "application/pdf", []byte("%PDF-1.7"))}, true},
+		{"punctuation in filename", []attachment{valid("résumé #1 (final).pdf", "application/pdf", []byte("%PDF-1.7"))}, false},
 		{"mismatched signature", []attachment{valid("foto.png", "image/png", []byte("not a png"))}, true},
 		{"unsupported mime", []attachment{{Name: "file.gif", MIMEType: "image/gif", Data: "R0lGODlh"}}, true},
 		{"data url prefix", []attachment{{Name: "dokumen.pdf", MIMEType: "application/pdf", Data: "data:application/pdf;base64,JVBERi0="}}, true},
@@ -331,6 +333,90 @@ func TestChatValidatesAfterAuthentication(t *testing.T) {
 	app.routes().ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("invalid payload status = %d, want 400", response.Code)
+	}
+}
+
+func TestChatReturns413WhenJSONBodyExceedsRequestLimit(t *testing.T) {
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer auth.Close()
+	app := &server{supabaseURL: auth.URL, supabaseKey: "anon", authClient: auth.Client()}
+
+	payload := `{"messages":[{"role":"user","content":"Halo"}]}` + strings.Repeat(" ", maxRequestBytes)
+	request := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer oversized-request-test-token")
+	response := httptest.NewRecorder()
+	app.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(response.Body.String(), "18 MiB") {
+		t.Fatalf("oversized request response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTPServerAllowsAttachmentUploadAndProviderBudgets(t *testing.T) {
+	httpServer := newHTTPServer("8080", http.NotFoundHandler())
+	if httpServer.ReadHeaderTimeout <= 0 || httpServer.ReadTimeout <= 10*time.Second {
+		t.Fatalf("request timeouts do not allow attachment uploads: header=%s body=%s",
+			httpServer.ReadHeaderTimeout, httpServer.ReadTimeout)
+	}
+	if httpServer.WriteTimeout < httpServer.ReadTimeout+providerTimeout {
+		t.Fatalf("write timeout %s must cover upload read timeout %s plus provider timeout %s",
+			httpServer.WriteTimeout, httpServer.ReadTimeout, providerTimeout)
+	}
+}
+
+func TestProviderAttemptTimeoutFallsBackAndReturns504WhenExhausted(t *testing.T) {
+	var slowCalls, fallbackCalls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/slow/test-model:generateContent":
+			atomic.AddInt32(&slowCalls, 1)
+			time.Sleep(100 * time.Millisecond)
+		case "/fallback":
+			atomic.AddInt32(&fallbackCalls, 1)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Balasan cadangan"}}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer auth.Close()
+
+	app := &server{
+		supabaseURL:         auth.URL,
+		supabaseKey:         "anon",
+		authClient:          auth.Client(),
+		client:              upstream.Client(),
+		chatTimeout:         time.Second,
+		providerCallTimeout: 20 * time.Millisecond,
+		providers: []provider{
+			{kind: providerGemini, apiKey: "gemini-key", model: "test-model", endpoint: upstream.URL + "/slow"},
+			{kind: providerGroq, apiKey: "groq-key", model: "test-model", endpoint: upstream.URL + "/fallback"},
+		},
+	}
+	makeRequest := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"messages":[{"role":"user","content":"Halo"}]}`))
+		request.Header.Set("Authorization", "Bearer provider-timeout-test-token")
+		response := httptest.NewRecorder()
+		app.routes().ServeHTTP(response, request)
+		return response
+	}
+
+	response := makeRequest()
+	if response.Code != http.StatusOK || atomic.LoadInt32(&slowCalls) != 1 || atomic.LoadInt32(&fallbackCalls) != 1 ||
+		!strings.Contains(response.Body.String(), "Balasan cadangan") {
+		t.Fatalf("fallback after provider timeout = %d slow=%d fallback=%d body=%s",
+			response.Code, atomic.LoadInt32(&slowCalls), atomic.LoadInt32(&fallbackCalls), response.Body.String())
+	}
+
+	app.providers = app.providers[:1]
+	response = makeRequest()
+	if response.Code != http.StatusGatewayTimeout || !strings.Contains(response.Body.String(), "Waktu tunggu penyedia AI habis.") {
+		t.Fatalf("terminal provider timeout = %d %s, want clear 504", response.Code, response.Body.String())
 	}
 }
 
